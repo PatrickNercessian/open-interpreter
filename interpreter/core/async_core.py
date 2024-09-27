@@ -30,6 +30,7 @@ try:
         Request,
         UploadFile,
         WebSocket,
+        BackgroundTasks,
     )
     from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
     from starlette.status import HTTP_403_FORBIDDEN
@@ -643,28 +644,37 @@ def create_router(async_interpreter):
     async def set_settings(payload: Dict[str, Any]):
         for key, value in payload.items():
             print("Updating settings...")
-            # print(f"Updating settings: {key} = {value}")
             if key in ["llm", "computer"] and isinstance(value, dict):
                 if key == "auto_run":
-                    return {
-                        "error": f"The setting {key} is not modifiable through the server due to security constraints."
-                    }, 403
+                    return JSONResponse(
+                        status_code=403,
+                        content={"error": f"The setting {key} is not modifiable through the server due to security constraints."}
+                    )
                 if hasattr(async_interpreter, key):
                     for sub_key, sub_value in value.items():
                         if hasattr(getattr(async_interpreter, key), sub_key):
                             setattr(getattr(async_interpreter, key), sub_key, sub_value)
                         else:
-                            return {
-                                "error": f"Sub-setting {sub_key} not found in {key}"
-                            }, 404
+                            return JSONResponse(
+                                status_code=404,
+                                content={"error": f"Sub-setting {sub_key} not found in {key}"}
+                            )
                 else:
-                    return {"error": f"Setting {key} not found"}, 404
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": f"Setting {key} not found"}
+                    )
             elif hasattr(async_interpreter, key):
+                print(f"Setting {key} to {value}")
                 setattr(async_interpreter, key, value)
+                print(f"Set {key} to {getattr(async_interpreter, key)}")
             else:
-                return {"error": f"Setting {key} not found"}, 404
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Setting {key} not found"}
+                )
 
-        return {"status": "success"}
+        return JSONResponse(content={"status": "success"})
 
     @router.get("/settings/{setting}")
     async def get_setting(setting: str):
@@ -716,6 +726,15 @@ def create_router(async_interpreter):
         role: str
         content: Union[str, List[Dict[str, Any]]]
 
+    class MaesterChatCompletionRequest(BaseModel):
+        thread_id: str
+        run_id: str
+        model: str = "default-model"
+        messages: List[ChatMessage]
+        max_tokens: Optional[int] = None
+        temperature: Optional[float] = None
+        stream: Optional[bool] = False
+
     class ChatCompletionRequest(BaseModel):
         model: str = "default-model"
         messages: List[ChatMessage]
@@ -764,9 +783,84 @@ def create_router(async_interpreter):
             if made_chunk:
                 break
 
+    MODEL_OUTPUT_SUFFIX = "_output.txt"
+
+    @router.get("/health")  # TODO maybe remove since we have a /heartbeat endpoint
+    async def health():
+        return {"status": "ok"}
+
+    @router.post("/maester/chat/create_run")
+    async def maester_chat_create_run(thread_id: str, run_id: str):
+        runs_dir_path = os.path.join("threads", thread_id, "runs")
+        if not os.path.exists(runs_dir_path):
+            os.makedirs(os.path.join(runs_dir_path, run_id), exist_ok=False)  # should not exist already
+            return {"status": "success"}
+
+        # Don't allow a run to be created if there are existing runs that are still running
+        # check and make sure all files in every run_dir are not empty
+        for run_dir in os.listdir(runs_dir_path):
+            for output_file in os.listdir(os.path.join(runs_dir_path, run_dir)):
+                output_file_path = os.path.join(runs_dir_path, run_dir, output_file)
+
+                # If the file was created over 30 seconds ago, we'll allow a new run to be created
+                # This is to prevent breaking it forever in case the file was just never written to
+                if time.time() - os.path.getctime(output_file_path) > 30:
+                    continue
+
+                # If the file is empty, raise an error because the run must still be running
+                if os.path.getsize(output_file_path) == 0:
+                    raise Exception(f"Output file {output_file_path} is empty")
+
+
+
+    @router.post("/maester/chat/completions")
+    async def maester_chat_completion(request: MaesterChatCompletionRequest, background_tasks: BackgroundTasks):
+        run_dir_path = os.path.join("threads", request.thread_id, "runs", request.run_id)
+
+        # Create an empty file
+        output_file_path = os.path.join(run_dir_path, request.model + MODEL_OUTPUT_SUFFIX)
+        open(output_file_path, 'w').close()
+
+        # Schedule the chat completion processing as a background task
+        background_tasks.add_task(_process_maester_chat_completion, request, output_file_path)
+
+        # Return an immediate response to the client
+        return {"status": "processing"}
+
+    async def _process_maester_chat_completion(request, output_file_path):
+        print("starting async _process_maester_chat_completion")
+        async_interpreter.messages = []  # TODO instead of this, replace it with our version of conversation history
+        chat_completion_response = await chat_completion(request)
+        print("chat_completion_response", chat_completion_response)
+
+        with open(output_file_path, "w") as f:
+            f.write(chat_completion_response["choices"][0]["message"]["content"])
+
+    @router.get("/maester/chat/completions/{thread_id}/{run_id}")
+    async def get_maester_chat_completion(thread_id: str, run_id: str):
+        run_dir_path = os.path.join("threads", thread_id, "runs", run_id)
+        responses = {}
+        for output_file in os.listdir(run_dir_path):
+            output_file_path = os.path.join(run_dir_path, output_file)
+            if not os.path.isfile(output_file_path) or not output_file_path.endswith(MODEL_OUTPUT_SUFFIX):
+                continue
+
+            model = output_file.replace(MODEL_OUTPUT_SUFFIX, "")
+
+            with open(output_file_path, "r") as f:
+                if os.path.getsize(output_file_path) == 0:  # TODO later, support constant writing to file, so we won't be able to just check for 0 size
+                    return { "status": "processing" }  # TODO make this an error if it's been too long
+                else:
+                    responses[model] = f.read()
+
+        return { "status": "completed", "responses": responses }
+
+
     @router.post("/openai/chat/completions")
     async def chat_completion(request: ChatCompletionRequest):
         global last_start_time
+
+        print("request", request)
 
         # Convert to LMC
         last_message = request.messages[-1]
@@ -846,6 +940,7 @@ def create_router(async_interpreter):
                     pass
                 else:
                     # More than 6 seconds have passed, so return
+                    print("More than 6 seconds have passed, so returning")
                     return
 
         else:
@@ -880,8 +975,9 @@ def create_router(async_interpreter):
 class Server:
     DEFAULT_HOST = "127.0.0.1"
     DEFAULT_PORT = 8000
+    DEFAULT_NUM_WORKERS = 4
 
-    def __init__(self, async_interpreter, host=None, port=None):
+    def __init__(self, async_interpreter, host=None, port=None, workers=None):
         self.app = FastAPI()
         router = create_router(async_interpreter)
         self.authenticate = authenticate_function
@@ -906,7 +1002,8 @@ class Server:
         self.app.include_router(router)
         h = host or os.getenv("HOST", Server.DEFAULT_HOST)
         p = port or int(os.getenv("PORT", Server.DEFAULT_PORT))
-        self.config = uvicorn.Config(app=self.app, host=h, port=p)
+        num_workers = int(os.getenv("NUM_WORKERS", Server.DEFAULT_NUM_WORKERS))
+        self.config = uvicorn.Config(app=self.app, host=h, port=p, workers=num_workers)
         self.uvicorn_server = uvicorn.Server(self.config)
 
     @property

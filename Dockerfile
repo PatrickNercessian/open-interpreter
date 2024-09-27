@@ -8,6 +8,8 @@ FROM python:3.11.8
 # Set environment variables
 # ENV OPENAI_API_KEY ...
 
+ENV PYTHONUNBUFFERED=1
+
 ENV HOST 0.0.0.0
 # ^ Sets the server host to 0.0.0.0, Required for the server to be accessible outside the container
 
@@ -21,7 +23,8 @@ COPY poetry.lock pyproject.toml README.md ./
 EXPOSE 8000
 
 # Install server dependencies
-RUN pip install ".[server]"
+# TODO maybe give version numbers to everything
+RUN pip install ".[server]" pandas==2.2.3
 
 # Start the server
-ENTRYPOINT ["interpreter", "--server"]
+ENTRYPOINT ["interpreter", "--server", "-y"]
